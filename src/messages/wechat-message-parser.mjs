@@ -143,6 +143,12 @@ function summarizeReferencedMessage(referMessage) {
   }
 }
 
+function resolveReferencedSenderWxid(referMessage) {
+  const chatUser = sanitizeText(referMessage?.chatUser);
+  const fromUser = sanitizeText(referMessage?.fromUser);
+  return chatUser || fromUser;
+}
+
 function buildQuotedMessage(referMessage) {
   if (!referMessage) {
     return null;
@@ -183,7 +189,7 @@ function buildQuotedMessage(referMessage) {
   return {
     type: msgType,
     message_id: referMessage.messageId || '',
-    from_wxid: referMessage.fromUser || '',
+    from_wxid: resolveReferencedSenderWxid(referMessage),
     display_name: referMessage.displayName || '',
     content,
     link_meta: linkMeta,
@@ -244,7 +250,7 @@ function extractAtUserList(xml = '', appPayload = null, selfWxid = '') {
     readXmlTag(messageSourceBlock, 'atuserlist') || readXmlTag(xml, 'atuserlist'),
   );
 
-  if (selfWxid && appPayload?.referMessage?.fromUser === selfWxid) {
+  if (selfWxid && resolveReferencedSenderWxid(appPayload?.referMessage) === selfWxid) {
     mentionIds.push(selfWxid);
   }
 

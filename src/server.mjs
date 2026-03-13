@@ -63,13 +63,20 @@ bridge.on('message', ({ payload, raw }) => {
     return;
   }
 
-  logger.info('inbound_message', {
+  const inboundLogFields = {
     message_id: payload?.data?.msgid || raw?.id || '',
     from_wxid: payload?.data?.from_wxid || raw?.sender || '',
-    room_wxid: payload?.data?.room_wxid || raw?.roomid || '',
+    room_wxid: payload?.data?.room_wxid || '',
     msg_type: payload?.msg_type || raw?.type || 0,
     content_preview: summarizeContentPreview(payload?.data?.content),
-  });
+  };
+
+  if (payload?.data?.quoted_message) {
+    inboundLogFields.quoted_from_wxid = payload.data.quoted_message.from_wxid || '';
+    inboundLogFields.quoted_preview = summarizeContentPreview(payload.data.quoted_message.content);
+  }
+
+  logger.info('inbound_message', inboundLogFields);
 
   if (config.debugRawInbound) {
     logger.debug('inbound_message_raw', {
@@ -92,6 +99,7 @@ bridge.on('message', ({ payload, raw }) => {
         content_fallback: Boolean(payload?.data?.content_fallback),
         at_user_list: Array.isArray(payload?.data?.at_user_list) ? payload.data.at_user_list : [],
         link_meta: payload?.data?.link_meta || null,
+        quoted_message: payload?.data?.quoted_message || null,
         media: payload?.data?.media || null,
       },
     });
