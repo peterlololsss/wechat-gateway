@@ -1,7 +1,8 @@
-yiconst DEFAULT_STARTUP_CONFIG = {
+const DEFAULT_STARTUP_CONFIG = {
   host: '0.0.0.0',
   port: 8000,
   webhookSecret: '',
+  webhookAuthToken: '',
   channelName: 'wechatferry',
   logLevel: 'info',
   debugRawInbound: false,
@@ -96,6 +97,9 @@ export function normalizeStartupConfig(rawConfig) {
     webhookSecret: typeof config.webhookSecret === 'string'
       ? config.webhookSecret.trim()
       : DEFAULT_STARTUP_CONFIG.webhookSecret,
+    webhookAuthToken: typeof config.webhookAuthToken === 'string'
+      ? config.webhookAuthToken.trim()
+      : DEFAULT_STARTUP_CONFIG.webhookAuthToken,
     channelName: typeof config.channelName === 'string' && config.channelName.trim()
       ? config.channelName.trim()
       : DEFAULT_STARTUP_CONFIG.channelName,

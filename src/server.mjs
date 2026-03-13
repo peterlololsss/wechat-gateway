@@ -137,6 +137,7 @@ bridge.on('message', ({ payload, raw }) => {
     retryCount: config.webhookRetryCount,
     retryBackoffMs: config.webhookRetryBackoffMs,
     retryBackoffMultiplier: config.webhookRetryBackoffMultiplier,
+    authToken: config.webhookAuthToken,
   }).catch(() => {});
 });
 
