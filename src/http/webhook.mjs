@@ -30,6 +30,10 @@ export async function postWebhook(targetUrl, payload, secret, options = {}) {
     headers['x-ntchat-secret'] = secret;
   }
 
+  if (options.authToken) {
+    headers['authorization'] = `Bearer ${options.authToken}`;
+  }
+
   let attempt = 0;
   let nextBackoffMs = retryBackoffMs;
   while (true) {
