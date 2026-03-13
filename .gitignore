@@ -1,0 +1,9 @@
+.idea/
+.ruff_cache/
+__pycache__/
+node_modules/
+downloads/
+logs/
+config.json
+openclaw-wentchat/
+*.log

@@ -1,0 +1,13 @@
+{
+	"name": "wechat-gateway",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"start": "node src/server.mjs",
+		"test": "node --test --experimental-test-isolation=none"
+	},
+	"dependencies": {
+		"playwright-core": "^1.58.2",
+		"wechatferry": "^0.0.26"
+	}
+}
