@@ -984,7 +984,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
           });
       if (!result.ok) {
         logger.error('revoke_message failed', {
-          message_id: resolvedMessageId,
+          message_id: messageId ?? '',
           local_id: localId ?? '',
           status: result.status,
         });
@@ -993,7 +993,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
       }
 
       logger.info('revoke_message', {
-        message_id: resolvedMessageId,
+        message_id: messageId ?? '',
         local_id: localId ?? '',
       });
       writeJson(res, 200, { status: 'success', message: 'Message revoked' });
