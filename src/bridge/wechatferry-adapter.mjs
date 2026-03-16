@@ -201,6 +201,10 @@ export class WechatFerryBridge extends EventEmitter {
     return wrapStatus(this.agent.revokeMsg(String(messageId)), 1);
   }
 
+  revokeMessageByLocalId(localId) {
+    return wrapStatus(this.agent.revokeMsg(String(localId)), 1);
+  }
+
   getHistory(chatWxid, options = {}) {
     const limit = Number.isFinite(Number(options.limit))
       ? Math.min(Math.max(Number(options.limit), 1), 200)

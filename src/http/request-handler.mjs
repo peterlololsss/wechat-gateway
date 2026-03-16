@@ -972,30 +972,16 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
-      let resolvedMessageId = messageId;
-      if (!resolvedMessageId && localId) {
-        const selfMessage = typeof bridge.waitForSelfMessageByLocalId === 'function'
-          ? await bridge.waitForSelfMessageByLocalId(localId, {
-              timeoutMs: 15000,
-              pollIntervalMs: 300,
-              requireMessageId: true,
-            })
-          : null;
-        resolvedMessageId = resolveNonEmptyString(selfMessage?.msgid);
-
-        if (!resolvedMessageId) {
-          logger.warn('revoke_message unresolved local_id', {
+      // Prefer local_id path to avoid MsgSvrID precision loss with large uint64 values.
+      const result = localId
+        ? await dispatchOutbound('revoke_message', () => bridge.revokeMessageByLocalId(localId), {
+            message_id: messageId ?? '',
             local_id: localId,
+          })
+        : await dispatchOutbound('revoke_message', () => bridge.revokeMessage(messageId), {
+            message_id: messageId,
+            local_id: '',
           });
-          writeJson(res, 409, { detail: 'local_id was found but message_id is not ready yet' });
-          return;
-        }
-      }
-
-      const result = await dispatchOutbound('revoke_message', () => bridge.revokeMessage(resolvedMessageId), {
-        message_id: resolvedMessageId,
-        local_id: localId ?? '',
-      });
       if (!result.ok) {
         logger.error('revoke_message failed', {
           message_id: resolvedMessageId,
