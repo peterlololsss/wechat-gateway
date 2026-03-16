@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { WechatMessageType } from 'wechatferry';
 import { streamLocalFileResponse } from './file-response.mjs';
 import { getPathname, getRequestUrl, isJsonRequest, readJsonBody, writeJson } from './http-utils.mjs';
 import { createLogger } from '../logger.mjs';
@@ -206,6 +207,32 @@ async function handleRoomMemberMutation({
   writeJson(res, 200, { status: 'success', message: successMessage });
 }
 
+function formatErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function buildSendSuccessBody(message, sentMessage, extra = {}) {
+  const body = {
+    status: 'success',
+    message,
+    ...extra,
+  };
+
+  if (sentMessage?.local_id) {
+    body.local_id = sentMessage.local_id;
+  }
+
+  if (sentMessage) {
+    body.sent_message = sentMessage;
+  }
+
+  if (sentMessage?.msgid) {
+    body.message_id = sentMessage.msgid;
+  }
+
+  return body;
+}
+
 export function createBridgeRequestHandler({ bridge, config, runtimeState, saveRuntimeState, inboundMessages, outboundSendQueue }) {
   async function dispatchOutbound(operation, task, fields) {
     if (!outboundSendQueue) {
@@ -213,6 +240,94 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
     }
 
     return outboundSendQueue.schedule(operation, () => Promise.resolve(task()), fields);
+  }
+
+  async function dispatchTrackedSend(operation, chatWxid, task, fields) {
+    return dispatchOutbound(operation, async () => {
+      let sentMessageBaseline = null;
+      if (typeof bridge.getLatestSelfHistoryMessage === 'function') {
+        try {
+          sentMessageBaseline = bridge.getLatestSelfHistoryMessage(chatWxid, {
+            requireMessageId: false,
+          });
+        } catch (error) {
+          logger.warn(`${operation} sent message baseline failed`, {
+            to_wxid: chatWxid,
+            error: formatErrorMessage(error),
+          });
+        }
+      }
+
+      const sendStartedAtMs = Date.now();
+      const result = await Promise.resolve(task());
+
+      return {
+        ...result,
+        sentMessageBaseline,
+        sendStartedAtMs,
+      };
+    }, fields);
+  }
+
+  async function resolveSentMessage(operation, chatWxid, trackedResult, criteria = {}) {
+    if (!trackedResult?.ok || typeof bridge.waitForSentMessage !== 'function') {
+      return null;
+    }
+
+    try {
+      const sentMessage = await bridge.waitForSentMessage(chatWxid, {
+        ...criteria,
+        afterLocalId: Number(trackedResult?.sentMessageBaseline?.local_id || 0),
+        minTimestamp: Math.max(Math.floor(Number(trackedResult?.sendStartedAtMs || Date.now()) / 1000) - 1, 0),
+      }, {
+        timeoutMs: 8000,
+        pollIntervalMs: 200,
+        limit: 20,
+        requireMessageId: true,
+      });
+
+      if (!sentMessage) {
+        logger.warn(`${operation} sent message lookup missed`, {
+          to_wxid: chatWxid,
+          after_local_id: Number(trackedResult?.sentMessageBaseline?.local_id || 0),
+          expected_type: Number.isFinite(Number(criteria.expectedType)) ? Number(criteria.expectedType) : '',
+          expected_media_kind: resolveNonEmptyString(criteria.expectedMediaKind),
+        });
+      }
+
+      return sentMessage;
+    } catch (error) {
+      logger.warn(`${operation} sent message lookup failed`, {
+        to_wxid: chatWxid,
+        error: formatErrorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  async function resolveFallbackSentMessage(operation, chatWxid, trackedResult, criteria = {}) {
+    if (!trackedResult?.ok || typeof bridge.waitForSentMessage !== 'function') {
+      return null;
+    }
+
+    try {
+      return await bridge.waitForSentMessage(chatWxid, {
+        ...criteria,
+        afterLocalId: Number(trackedResult?.sentMessageBaseline?.local_id || 0),
+        minTimestamp: Math.max(Math.floor(Number(trackedResult?.sendStartedAtMs || Date.now()) / 1000) - 1, 0),
+      }, {
+        timeoutMs: 1500,
+        pollIntervalMs: 200,
+        limit: 20,
+        requireMessageId: false,
+      });
+    } catch (error) {
+      logger.warn(`${operation} sent message local lookup failed`, {
+        to_wxid: chatWxid,
+        error: formatErrorMessage(error),
+      });
+      return null;
+    }
   }
 
   const routes = new Map([
@@ -311,7 +426,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
-      const result = await dispatchOutbound('send_text', () => bridge.sendText(toWxid, content, atList), {
+      const result = await dispatchTrackedSend('send_text', toWxid, () => bridge.sendText(toWxid, content, atList), {
         to_wxid: toWxid,
         at_count: atList.length,
       });
@@ -325,12 +440,20 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
+      const sendTextCriteria = {
+        expectedType: WechatMessageType.Text,
+        expectedContent: content,
+      };
+      const sentMessage = await resolveSentMessage('send_text', toWxid, result, sendTextCriteria)
+        || await resolveFallbackSentMessage('send_text', toWxid, result, sendTextCriteria);
+
       logger.info('send_text', {
         to_wxid: toWxid,
         content_length: content.length,
         at_count: atList.length,
+        message_id: sentMessage?.msgid || '',
       });
-      writeJson(res, 200, { status: 'success', message: 'Message sent' });
+      writeJson(res, 200, buildSendSuccessBody('Message sent', sentMessage));
     }],
     ['POST /send_rich_text', async (req, res) => {
       if (!requireJson(req, res)) {
@@ -354,7 +477,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
-      const result = await dispatchOutbound('send_rich_text', () => bridge.sendRichText(toWxid, {
+      const result = await dispatchTrackedSend('send_rich_text', toWxid, () => bridge.sendRichText(toWxid, {
         title,
         url,
         digest,
@@ -377,12 +500,20 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
+      const sendRichTextCriteria = {
+        expectedType: WechatMessageType.App,
+        expectedContent: title,
+      };
+      const sentMessage = await resolveSentMessage('send_rich_text', toWxid, result, sendRichTextCriteria)
+        || await resolveFallbackSentMessage('send_rich_text', toWxid, result, sendRichTextCriteria);
+
       logger.info('send_rich_text', {
         to_wxid: toWxid,
         title,
         url,
+        message_id: sentMessage?.msgid || '',
       });
-      writeJson(res, 200, { status: 'success', message: 'Rich text sent' });
+      writeJson(res, 200, buildSendSuccessBody('Rich text sent', sentMessage));
     }],
     ['POST /send_image', async (req, res) => {
       if (!requireJson(req, res)) {
@@ -401,7 +532,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
-      const result = await dispatchOutbound('send_image', () => bridge.sendImage(toWxid, imagePathResult.path), {
+      const result = await dispatchTrackedSend('send_image', toWxid, () => bridge.sendImage(toWxid, imagePathResult.path), {
         to_wxid: toWxid,
         image_path: imagePathResult.path,
       });
@@ -415,11 +546,19 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
+      const sendImageCriteria = {
+        expectedType: WechatMessageType.Image,
+        expectedMediaKind: 'image',
+      };
+      const sentMessage = await resolveSentMessage('send_image', toWxid, result, sendImageCriteria)
+        || await resolveFallbackSentMessage('send_image', toWxid, result, sendImageCriteria);
+
       logger.info('send_image', {
         to_wxid: toWxid,
         image_path: imagePathResult.path,
+        message_id: sentMessage?.msgid || '',
       });
-      writeJson(res, 200, { status: 'success', message: 'Image sent' });
+      writeJson(res, 200, buildSendSuccessBody('Image sent', sentMessage));
     }],
     ['POST /decrypt_image', async (req, res) => {
       if (!requireJson(req, res)) {
@@ -586,7 +725,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
-      const result = await dispatchOutbound('send_file', () => bridge.sendFile(toWxid, filePathResult.path), {
+      const result = await dispatchTrackedSend('send_file', toWxid, () => bridge.sendFile(toWxid, filePathResult.path), {
         to_wxid: toWxid,
         file_path: filePathResult.path,
       });
@@ -600,11 +739,19 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
+      const sendFileCriteria = {
+        expectedType: WechatMessageType.File,
+        expectedMediaKind: 'file',
+      };
+      const sentMessage = await resolveSentMessage('send_file', toWxid, result, sendFileCriteria)
+        || await resolveFallbackSentMessage('send_file', toWxid, result, sendFileCriteria);
+
       logger.info('send_file', {
         to_wxid: toWxid,
         file_path: filePathResult.path,
+        message_id: sentMessage?.msgid || '',
       });
-      writeJson(res, 200, { status: 'success', message: 'File sent' });
+      writeJson(res, 200, buildSendSuccessBody('File sent', sentMessage));
     }],
     ['POST /send_media_upload', async (req, res) => {
       if (!requireJson(req, res)) {
@@ -645,7 +792,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
       const sendOperation = mediaKind === 'image'
         ? () => bridge.sendImage(toWxid, upload.saved_path)
         : () => bridge.sendFile(toWxid, upload.saved_path);
-      const result = await dispatchOutbound('send_media_upload', sendOperation, {
+      const result = await dispatchTrackedSend('send_media_upload', toWxid, sendOperation, {
         to_wxid: toWxid,
         media_kind: mediaKind,
         file_name: upload.file_name,
@@ -664,21 +811,27 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
+      const sendMediaUploadCriteria = {
+        expectedType: mediaKind === 'image' ? WechatMessageType.Image : WechatMessageType.File,
+        expectedMediaKind: mediaKind,
+      };
+      const sentMessage = await resolveSentMessage('send_media_upload', toWxid, result, sendMediaUploadCriteria)
+        || await resolveFallbackSentMessage('send_media_upload', toWxid, result, sendMediaUploadCriteria);
+
       logger.info('send_media_upload', {
         to_wxid: toWxid,
         media_kind: mediaKind,
         file_name: upload.file_name,
         saved_path: upload.saved_path,
         bytes: upload.bytes,
+        message_id: sentMessage?.msgid || '',
       });
-      writeJson(res, 200, {
-        status: 'success',
-        message: 'Uploaded media sent',
+      writeJson(res, 200, buildSendSuccessBody('Uploaded media sent', sentMessage, {
         upload: {
           media_kind: mediaKind,
           ...upload,
         },
-      });
+      }));
     }],
     ['POST /download_audio', async (req, res) => {
       if (!requireJson(req, res)) {
@@ -775,7 +928,7 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
-      const result = await dispatchOutbound('forward_message', () => bridge.forwardMessage(toWxid, messageId), {
+      const result = await dispatchTrackedSend('forward_message', toWxid, () => bridge.forwardMessage(toWxid, messageId), {
         to_wxid: toWxid,
         message_id: messageId,
       });
@@ -789,11 +942,15 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
+      const sentMessage = await resolveSentMessage('forward_message', toWxid, result)
+        || await resolveFallbackSentMessage('forward_message', toWxid, result);
+
       logger.info('forward_message', {
         to_wxid: toWxid,
         message_id: messageId,
+        forwarded_message_id: sentMessage?.msgid || '',
       });
-      writeJson(res, 200, { status: 'success', message: 'Message forwarded' });
+      writeJson(res, 200, buildSendSuccessBody('Message forwarded', sentMessage));
     }],
     ['POST /revoke_message', async (req, res) => {
       if (!requireJson(req, res)) {
@@ -802,21 +959,47 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
 
       const body = await readJsonBody(req);
       const messageId = resolveNonEmptyString(body?.message_id);
+      const localId = resolveBoundedInteger(body?.local_id, {
+        defaultValue: undefined,
+        min: 1,
+      });
 
-      if (!messageId) {
-        writeJson(res, 422, { detail: 'message_id is required' });
+      if (!messageId && !localId) {
+        writeJson(res, 422, { detail: 'message_id or local_id is required' });
         return;
       }
       if (!requireLogin(bridge, res)) {
         return;
       }
 
-      const result = await dispatchOutbound('revoke_message', () => bridge.revokeMessage(messageId), {
-        message_id: messageId,
+      let resolvedMessageId = messageId;
+      if (!resolvedMessageId && localId) {
+        const selfMessage = typeof bridge.waitForSelfMessageByLocalId === 'function'
+          ? await bridge.waitForSelfMessageByLocalId(localId, {
+              timeoutMs: 15000,
+              pollIntervalMs: 300,
+              requireMessageId: true,
+            })
+          : null;
+        resolvedMessageId = resolveNonEmptyString(selfMessage?.msgid);
+
+        if (!resolvedMessageId) {
+          logger.warn('revoke_message unresolved local_id', {
+            local_id: localId,
+          });
+          writeJson(res, 409, { detail: 'local_id was found but message_id is not ready yet' });
+          return;
+        }
+      }
+
+      const result = await dispatchOutbound('revoke_message', () => bridge.revokeMessage(resolvedMessageId), {
+        message_id: resolvedMessageId,
+        local_id: localId ?? '',
       });
       if (!result.ok) {
         logger.error('revoke_message failed', {
-          message_id: messageId,
+          message_id: resolvedMessageId,
+          local_id: localId ?? '',
           status: result.status,
         });
         writeJson(res, 500, { detail: `revoke_message failed with status ${result.status}` });
@@ -824,7 +1007,8 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
       }
 
       logger.info('revoke_message', {
-        message_id: messageId,
+        message_id: resolvedMessageId,
+        local_id: localId ?? '',
       });
       writeJson(res, 200, { status: 'success', message: 'Message revoked' });
     }],

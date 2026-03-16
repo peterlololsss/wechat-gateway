@@ -18,6 +18,7 @@ import {
   saveGeneratedLocalFile,
 } from '../media/media-downloads.mjs';
 import { resolveMpArticleWithBrowser } from '../media/mp-article-resolver.mjs';
+import { findMatchingSelfHistoryMessage } from './self-message-matcher.mjs';
 
 function createLocalFileBox(filePath) {
   return {
@@ -33,6 +34,15 @@ function wrapStatus(status, successStatus = 0) {
     ok: status === successStatus,
     status,
   };
+}
+
+function clampPositiveInteger(value, defaultValue, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const normalized = Number(value);
+  if (!Number.isFinite(normalized)) {
+    return defaultValue;
+  }
+
+  return Math.min(Math.max(Math.trunc(normalized), min), max);
 }
 
 export class WechatFerryBridge extends EventEmitter {
@@ -217,6 +227,104 @@ export class WechatFerryBridge extends EventEmitter {
       .sort((left, right) => Number(right?.createTime || 0) - Number(left?.createTime || 0))
       .slice(0, limit)
       .map(normalizeHistoryMessage);
+  }
+
+  getLatestSelfHistoryMessage(chatWxid, options = {}) {
+    const history = this.getHistory(chatWxid, {
+      limit: clampPositiveInteger(options.limit, 20, { min: 1, max: 200 }),
+      dbNumber: options.dbNumber,
+    });
+
+    return findMatchingSelfHistoryMessage(history, {
+      expectedChatWxid: chatWxid,
+      requireMessageId: options.requireMessageId,
+    });
+  }
+
+  getSelfMessageByLocalId(localId) {
+    const normalizedLocalId = clampPositiveInteger(localId, 0, { min: 0 });
+    if (!normalizedLocalId) {
+      return null;
+    }
+
+    const message = this.agent.getLastSelfMessage(normalizedLocalId);
+    if (!message?.localId) {
+      return null;
+    }
+
+    return normalizeHistoryMessage(message);
+  }
+
+  async waitForSelfMessageByLocalId(localId, options = {}) {
+    const normalizedLocalId = clampPositiveInteger(localId, 0, { min: 0 });
+    if (!normalizedLocalId) {
+      return null;
+    }
+
+    const timeoutMs = clampPositiveInteger(options.timeoutMs, 5000, { min: 200, max: 30000 });
+    const pollIntervalMs = clampPositiveInteger(options.pollIntervalMs, 250, { min: 50, max: 5000 });
+    const requireMessageId = options.requireMessageId !== false;
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() <= deadline) {
+      const message = this.getSelfMessageByLocalId(normalizedLocalId);
+      if (message && (!requireMessageId || message.msgid)) {
+        return message;
+      }
+
+      if (Date.now() >= deadline) {
+        break;
+      }
+
+      await sleep(pollIntervalMs);
+    }
+
+    return null;
+  }
+
+  async waitForSentMessage(chatWxid, criteria = {}, options = {}) {
+    const timeoutMs = clampPositiveInteger(options.timeoutMs, 5000, { min: 200, max: 30000 });
+    const pollIntervalMs = clampPositiveInteger(options.pollIntervalMs, 250, { min: 50, max: 5000 });
+    const limit = clampPositiveInteger(options.limit, 20, { min: 1, max: 200 });
+    const requireMessageId = options.requireMessageId !== false;
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() <= deadline) {
+      const history = this.getHistory(chatWxid, {
+        limit,
+        dbNumber: options.dbNumber,
+      });
+      const match = findMatchingSelfHistoryMessage(history, {
+        ...criteria,
+        expectedChatWxid: chatWxid,
+        requireMessageId: false,
+      });
+
+      if (match) {
+        if (!requireMessageId || match.msgid) {
+          return match;
+        }
+
+        const remainingMs = Math.max(deadline - Date.now(), 0);
+        const upgraded = await this.waitForSelfMessageByLocalId(match.local_id, {
+          timeoutMs: remainingMs || pollIntervalMs,
+          pollIntervalMs,
+          requireMessageId: true,
+        });
+
+        if (upgraded?.msgid) {
+          return upgraded;
+        }
+      }
+
+      if (Date.now() >= deadline) {
+        break;
+      }
+
+      await sleep(pollIntervalMs);
+    }
+
+    return null;
   }
 
   async downloadMedia(rawMessage, options = {}) {
