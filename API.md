@@ -423,9 +423,25 @@ curl "http://localhost:8000/history?chat_wxid=wxid_xxx&limit=20"
 ```json
 {
   "status": "success",
-  "message": "Message sent"
+  "message": "Message sent",
+  "message_id": "987654321",
+  "local_id": 123,
+  "sent_message": {
+    "local_id": 123,
+    "msgid": "987654321",
+    "type": 1,
+    "is_self": true,
+    "timestamp": 1709600000,
+    "chat_wxid": "wxid_xxxxxxxxxxxx",
+    "room_wxid": "",
+    "content": "消息内容"
+  }
 }
 ```
+
+发送成功后，Bridge 会尝试从本地历史消息中定位刚发出的 self message。定位成功时，会额外返回 `message_id` 和 `sent_message`。调用 `POST /revoke_message` 时，应优先使用这里返回的 `message_id`。
+
+如果消息已经写入本地数据库、但微信服务器侧 `message_id` 尚未回填，响应仍可能先返回 `local_id` 和 `sent_message`，此时可在后续调用 `POST /revoke_message` 时传 `local_id` 作为兜底。
 
 **错误响应**:
 
@@ -460,7 +476,8 @@ curl "http://localhost:8000/history?chat_wxid=wxid_xxx&limit=20"
 ```json
 {
   "status": "success",
-  "message": "Image sent"
+  "message": "Image sent",
+  "message_id": "987654321"
 }
 ```
 
@@ -497,7 +514,8 @@ curl "http://localhost:8000/history?chat_wxid=wxid_xxx&limit=20"
 ```json
 {
   "status": "success",
-  "message": "File sent"
+  "message": "File sent",
+  "message_id": "987654321"
 }
 ```
 
@@ -543,6 +561,7 @@ curl "http://localhost:8000/history?chat_wxid=wxid_xxx&limit=20"
 {
   "status": "success",
   "message": "Uploaded media sent",
+  "message_id": "987654321",
   "upload": {
     "media_kind": "image",
     "upload_dir": "D:\\PycharmProjects\\wechat-gateway\\downloads\\outbound-upload",
@@ -586,7 +605,8 @@ curl "http://localhost:8000/history?chat_wxid=wxid_xxx&limit=20"
 ```json
 {
   "status": "success",
-  "message": "Message forwarded"
+  "message": "Message forwarded",
+  "message_id": "123456789"
 }
 ```
 
@@ -608,13 +628,15 @@ curl "http://localhost:8000/history?chat_wxid=wxid_xxx&limit=20"
 
 ```json
 {
-  "message_id": "987654321"
+  "message_id": "987654321",
+  "local_id": 123
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `message_id` | string | 是 | 要撤回的消息 ID |
+| `message_id` | string | 否 | 要撤回的消息 ID。对于通过 `POST /send_text`、`POST /send_image`、`POST /send_file`、`POST /send_media_upload` 或 `POST /forward_message` 发出的消息，应优先使用发送成功响应中返回的 `message_id` |
+| `local_id` | integer | 否 | 本地消息 ID。若发送成功响应里暂时还没有 `message_id`，可传 `local_id` 让 Bridge 轮询解析出真实 `message_id` 后再撤回 |
 
 **响应 (成功)**:
 
@@ -629,7 +651,8 @@ curl "http://localhost:8000/history?chat_wxid=wxid_xxx&limit=20"
 
 | 状态码 | 说明 |
 |--------|------|
-| `422` | 缺少 `message_id` |
+| `409` | 提供了 `local_id`，但微信服务器侧 `message_id` 仍未就绪 |
+| `422` | 缺少 `message_id` 和 `local_id` |
 | `503` | 微信未登录 |
 | `500` | 撤回失败 (`{"detail": "错误信息"}`) |
 
