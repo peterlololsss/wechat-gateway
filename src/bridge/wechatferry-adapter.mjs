@@ -205,6 +205,23 @@ export class WechatFerryBridge extends EventEmitter {
     return wrapStatus(this.agent.revokeMsg(String(localId)), 1);
   }
 
+  lookupLocalIdBySvrId(svrId) {
+    // Search across all MSG databases for a message with this MsgSvrID
+    const dbList = this.agent.getDbList?.() ?? [];
+    const msgDbs = dbList.filter(name => /^MSG\d*\.db$/i.test(name));
+    for (const dbName of msgDbs) {
+      try {
+        const rows = this.agent.dbSqlQuery?.(dbName, `SELECT localId FROM MSG WHERE MsgSvrID=${svrId} LIMIT 1`);
+        if (Array.isArray(rows) && rows.length > 0 && rows[0]?.localId) {
+          return Number(rows[0].localId);
+        }
+      } catch {
+        // skip
+      }
+    }
+    return null;
+  }
+
   getHistory(chatWxid, options = {}) {
     const limit = Number.isFinite(Number(options.limit))
       ? Math.min(Math.max(Number(options.limit), 1), 200)
