@@ -57,8 +57,11 @@ bridge.on('error', (error) => {
 
 bridge.on('message', ({ payload, raw }) => {
   if (raw?.is_self) {
-    logger.debug('skip self message', {
-      message_id: raw?.id || '',
+    logger.info('self message', {
+      raw_id: raw?.id || '',
+      payload_msgid: payload?.data?.msgid || '',
+      to_wxid: raw?.roomid || raw?.sender || '',
+      content_preview: summarizeContentPreview(raw?.content),
     });
     return;
   }
