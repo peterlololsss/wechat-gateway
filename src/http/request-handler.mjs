@@ -972,11 +972,16 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
         return;
       }
 
-      // Prefer local_id path to avoid MsgSvrID precision loss with large uint64 values.
-      const result = localId
-        ? await dispatchOutbound('revoke_message', () => bridge.revokeMessageByLocalId(localId), {
+      // Resolve local_id from svrid via DB lookup to avoid uint64 precision loss.
+      let resolvedLocalId = localId;
+      if (!resolvedLocalId && messageId && typeof bridge.lookupLocalIdBySvrId === 'function') {
+        resolvedLocalId = bridge.lookupLocalIdBySvrId(messageId);
+      }
+
+      const result = resolvedLocalId
+        ? await dispatchOutbound('revoke_message', () => bridge.revokeMessageByLocalId(resolvedLocalId), {
             message_id: messageId ?? '',
-            local_id: localId,
+            local_id: resolvedLocalId,
           })
         : await dispatchOutbound('revoke_message', () => bridge.revokeMessage(messageId), {
             message_id: messageId,
