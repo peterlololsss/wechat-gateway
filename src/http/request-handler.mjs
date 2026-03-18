@@ -1003,6 +1003,67 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
       });
       writeJson(res, 200, { status: 'success', message: 'Message revoked' });
     }],
+    ['POST /decrypt_image_by_svrid', async (req, res) => {
+      if (!requireJson(req, res)) {
+        return;
+      }
+
+      const body = await readJsonBody(req);
+      const svrId = resolveNonEmptyString(body?.svrid);
+      const chatWxid = resolveNonEmptyString(body?.chat_wxid);
+      const timeoutSeconds = resolveBoundedInteger(body?.timeout_seconds, {
+        defaultValue: 30,
+        min: 1,
+        max: 120,
+      });
+      const responseMode = resolveDownloadResponseMode(body?.response_mode);
+
+      if (!svrId || !chatWxid) {
+        writeJson(res, 422, { detail: 'svrid and chat_wxid are required' });
+        return;
+      }
+      if (!requireLogin(bridge, res)) {
+        return;
+      }
+
+      try {
+        const image = await bridge.decryptImageBySvrId(svrId, chatWxid, {
+          timeoutSeconds,
+          downloadDir: config.mediaDownloadDir,
+        });
+
+        logger.info('decrypt_image_by_svrid', {
+          svrid: svrId,
+          chat_wxid: chatWxid,
+          saved_path: image.saved_path,
+          response_mode: responseMode,
+        });
+
+        if (responseMode === 'binary') {
+          await streamLocalFileResponse(res, {
+            filePath: image.saved_path,
+            fileName: image.file_name,
+            mediaKind: 'image',
+            messageId: svrId,
+          });
+          return;
+        }
+
+        writeJson(res, 200, {
+          status: 'success',
+          message: 'Image decrypted from history',
+          image,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error('decrypt_image_by_svrid failed', {
+          svrid: svrId,
+          chat_wxid: chatWxid,
+          error: message,
+        });
+        writeJson(res, 500, { detail: message });
+      }
+    }],
     ['POST /download_media', async (req, res) => {
       if (!requireJson(req, res)) {
         return;

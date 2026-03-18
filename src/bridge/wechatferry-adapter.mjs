@@ -205,6 +205,53 @@ export class WechatFerryBridge extends EventEmitter {
     return wrapStatus(this.agent.revokeMsg(String(localId)), 1);
   }
 
+  lookupHistoryMessageBySvrId(svrId, chatWxid) {
+    if (!chatWxid) return null;
+    // Search recent history for this chatWxid and find the message with matching svrid
+    const history = this.getHistory(chatWxid, { limit: 100 });
+    return history.find(m => m.msgid === String(svrId)) ?? null;
+  }
+
+  async decryptImageBySvrId(svrId, chatWxid, options = {}) {
+    const historyMsg = this.lookupHistoryMessageBySvrId(svrId, chatWxid);
+    if (!historyMsg) {
+      throw new Error(`Message not found in history for svrid ${svrId}`);
+    }
+    if (!historyMsg.extra_path) {
+      throw new Error('Image extra path is unavailable in history record');
+    }
+
+    const timeoutSeconds = Number.isFinite(Number(options.timeoutSeconds))
+      ? Math.min(Math.max(Number(options.timeoutSeconds), 1), 120)
+      : 30;
+    const downloadConfig = {
+      mediaDownloadDir: options.downloadDir || this.config.mediaDownloadDir,
+    };
+    const outputDir = await ensureMediaStorageDir(downloadConfig, 'images');
+
+    // Trigger download if needed
+    const localId = String(historyMsg.local_id || '');
+    const thumbPath = historyMsg.thumb_path || '';
+    const extraPath = historyMsg.extra_path;
+    this.agent.wcf.downloadAttach(localId, thumbPath, extraPath);
+
+    for (let attempt = 0; attempt < timeoutSeconds; attempt += 1) {
+      const sourcePath = this.agent.wcf.decryptImage(extraPath, outputDir);
+      if (sourcePath) {
+        return {
+          message_id: svrId,
+          local_id: historyMsg.local_id,
+          media: { kind: 'image' },
+          saved_path: sourcePath,
+          file_name: sourcePath.split(/[/\\]/).pop() || 'image.png',
+        };
+      }
+      await sleep(1000);
+    }
+
+    throw new Error('Image decrypt timeout');
+  }
+
   lookupLocalIdBySvrId(svrId) {
     // Search across all MSG databases for a message with this MsgSvrID
     const dbList = this.agent.getDbList?.() ?? [];
