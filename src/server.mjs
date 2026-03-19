@@ -9,6 +9,7 @@ import { createBridgeRequestHandler } from './http/request-handler.mjs';
 import { ensureWeChatRunning } from './bridge/wechat-launcher.mjs';
 import { postWebhook } from './http/webhook.mjs';
 import { WechatFerryBridge } from './bridge/wechatferry-adapter.mjs';
+import { shouldAllowSelfInboundMessage } from './messages/self-message-policy.mjs';
 
 // Load mutable runtime state first so a legacy webhookUrl can be migrated out of config.json.
 const runtimeState = loadRuntimeState();
@@ -56,7 +57,8 @@ bridge.on('error', (error) => {
 });
 
 bridge.on('message', ({ payload, raw }) => {
-  if (raw?.is_self) {
+  const allowSelfInbound = shouldAllowSelfInboundMessage(raw, payload);
+  if (raw?.is_self && !allowSelfInbound) {
     logger.info('self message', {
       raw_id: raw?.id || '',
       payload_msgid: payload?.data?.msgid || '',
@@ -64,6 +66,14 @@ bridge.on('message', ({ payload, raw }) => {
       content_preview: summarizeContentPreview(raw?.content),
     });
     return;
+  }
+
+  if (raw?.is_self) {
+    logger.info('self notice', {
+      message_id: payload?.data?.msgid || raw?.id || '',
+      msg_type: payload?.msg_type || raw?.type || 0,
+      content_preview: summarizeContentPreview(payload?.data?.content || raw?.content),
+    });
   }
 
   const inboundLogFields = {

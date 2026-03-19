@@ -58,7 +58,7 @@ export function normalizeHistoryMessage(message) {
 
   return {
     local_id: Number(message?.localId || 0),
-    msgid: message?.msgSvrId ? String(message.msgSvrId) : '',
+    msgid: String(message?.msgSvrIdStr || '').trim() || (message?.msgSvrId ? String(message.msgSvrId) : ''),
     type: Number(message?.type || 0),
     sub_type: Number(message?.subType || 0),
     is_self: Boolean(message?.isSender),
