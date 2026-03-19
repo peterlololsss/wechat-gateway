@@ -1,7 +1,8 @@
 import EventEmitter from 'node:events';
-import { copyFile } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { access, copyFile } from 'node:fs/promises';
+import { basename, isAbsolute, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { Wechatferry, WechatferrySDK } from 'wechatferry';
 import { WechatferryAgent } from 'wechatferry/agent';
 import {
   buildWebhookPayload,
@@ -18,7 +19,7 @@ import {
   saveGeneratedLocalFile,
 } from '../media/media-downloads.mjs';
 import { resolveMpArticleWithBrowser } from '../media/mp-article-resolver.mjs';
-import { findMatchingSelfHistoryMessage } from './self-message-matcher.mjs';
+import { findMatchingSelfHistoryMessage, hasReadyMessageId } from './self-message-matcher.mjs';
 
 function createLocalFileBox(filePath) {
   return {
@@ -45,13 +46,120 @@ function clampPositiveInteger(value, defaultValue, { min = 1, max = Number.MAX_S
   return Math.min(Math.max(Math.trunc(normalized), min), max);
 }
 
+function escapeSqlStringLiteral(value) {
+  return `'${String(value ?? '').replace(/'/g, "''")}'`;
+}
+
+function compareCreateTimeDesc(left, right) {
+  return Number(right?.createTime || 0) - Number(left?.createTime || 0);
+}
+
+function buildHistorySelectSql({ whereClause, limit, beforeCreateTime }) {
+  const beforeClause = beforeCreateTime
+    ? ` AND MSG.CreateTime < ${beforeCreateTime}`
+    : '';
+
+  return `
+    SELECT
+      MSG.localId AS localId,
+      TalkerId.TalkerId AS talkerId,
+      MSG.MsgSvrID AS msgSvrId,
+      CAST(MSG.MsgSvrID AS TEXT) AS msgSvrIdStr,
+      MSG.Type AS type,
+      MSG.SubType AS subType,
+      MSG.IsSender AS isSender,
+      MSG.CreateTime AS createTime,
+      MSG.Sequence AS sequence,
+      MSG.StatusEx AS statusEx,
+      MSG.FlagEx AS flagEx,
+      MSG.Status AS status,
+      MSG.MsgServerSeq AS msgServerSeq,
+      MSG.MsgSequence AS msgSequence,
+      MSG.StrTalker AS strTalker,
+      MSG.StrContent AS strContent,
+      MSG.BytesExtra AS bytesExtra,
+      MSG.CompressContent AS compressContent
+    FROM MSG
+    JOIN (
+      SELECT ROW_NUMBER() OVER (ORDER BY (SELECT 0)) AS TalkerId, UsrName
+      FROM Name2ID
+    ) AS TalkerId
+      ON MSG.TalkerId = TalkerId.TalkerId
+    WHERE ${whereClause}${beforeClause}
+    ORDER BY MSG.CreateTime DESC
+    LIMIT ${limit}
+  `;
+}
+
+function normalizeCandidateIdentifier(value) {
+  const normalized = String(value ?? '').trim();
+  return normalized && normalized !== '0' ? normalized : '';
+}
+
+function buildRevokeCandidateIds(record, preferredId) {
+  const candidates = [
+    preferredId,
+    record?.msgSvrIdStr,
+    record?.msgSvrId,
+    record?.msgServerSeq,
+    record?.msgSequence,
+    record?.sequence,
+    record?.localId,
+  ]
+    .map(normalizeCandidateIdentifier)
+    .filter(Boolean);
+
+  return [...new Set(candidates)];
+}
+
+function normalizeWindowsPath(value) {
+  return String(value ?? '').trim().replace(/\//g, '\\');
+}
+
+function extractWechatFilesRoot(filePath) {
+  const normalized = normalizeWindowsPath(filePath);
+  if (!normalized) {
+    return '';
+  }
+
+  const marker = '\\wechat files\\';
+  const markerIndex = normalized.toLowerCase().indexOf(marker);
+  if (markerIndex === -1) {
+    return '';
+  }
+
+  return normalized.slice(0, markerIndex + marker.length - 1);
+}
+
+function buildDefaultWechatFilesRoots() {
+  const candidates = [];
+  const userProfile = String(process.env.USERPROFILE || '').trim();
+  const oneDrive = String(process.env.OneDrive || '').trim();
+
+  if (userProfile) {
+    candidates.push(resolve(userProfile, 'Documents', 'WeChat Files'));
+  }
+  if (oneDrive) {
+    candidates.push(resolve(oneDrive, 'Documents', 'WeChat Files'));
+  }
+
+  return [...new Set(candidates.map(normalizeWindowsPath).filter(Boolean))];
+}
+
 export class WechatFerryBridge extends EventEmitter {
   constructor(config) {
     super();
     this.config = config;
-    this.agent = new WechatferryAgent({ keepalive: config.keepalive });
+    const agentOptions = { keepalive: config.keepalive };
+    if (config.sdkRoot) {
+      agentOptions.wcf = new Wechatferry({
+        sdk: new WechatferrySDK({ sdkRoot: config.sdkRoot }),
+      });
+    }
+    this.agent = new WechatferryAgent(agentOptions);
     this.selfInfoRaw = null;
     this.selfInfo = normalizeSelfInfo(null);
+    this.wechatFilesRoots = new Set(buildDefaultWechatFilesRoots());
     this.started = false;
 
     this.handleLogin = this.handleLogin.bind(this);
@@ -104,6 +212,8 @@ export class WechatFerryBridge extends EventEmitter {
 
   async handleMessage(message) {
     try {
+      this.observeWechatMediaPath(message?.thumb || message?.thumb_path || '');
+      this.observeWechatMediaPath(message?.extra || message?.extra_path || '');
       const selfInfo = await this.getLoginInfo();
       const payload = buildWebhookPayload(message, selfInfo, this.config.channelName);
       this.emit('message', { payload, raw: message });
@@ -198,11 +308,21 @@ export class WechatFerryBridge extends EventEmitter {
   }
 
   revokeMessage(messageId) {
-    return wrapStatus(this.agent.revokeMsg(String(messageId)), 1);
+    return this.revokeMessageCandidates([messageId]);
   }
 
   revokeMessageByLocalId(localId) {
-    return wrapStatus(this.agent.revokeMsg(String(localId)), 1);
+    const record = this.lookupMessageIdentifiersByLocalId(localId);
+    const candidates = buildRevokeCandidateIds(record);
+    if (candidates.length === 0) {
+      return {
+        ok: false,
+        status: -2,
+        attempted_ids: [],
+      };
+    }
+
+    return this.revokeMessageCandidates(candidates);
   }
 
   lookupHistoryMessageBySvrId(svrId, chatWxid) {
@@ -210,6 +330,38 @@ export class WechatFerryBridge extends EventEmitter {
     // Search recent history for this chatWxid and find the message with matching svrid
     const history = this.getHistory(chatWxid, { limit: 100 });
     return history.find(m => m.msgid === String(svrId)) ?? null;
+  }
+
+  observeWechatMediaPath(filePath) {
+    const root = extractWechatFilesRoot(filePath);
+    if (root) {
+      this.wechatFilesRoots.add(root);
+    }
+  }
+
+  async resolveHistoryMediaPath(filePath) {
+    const normalizedPath = normalizeWindowsPath(filePath);
+    if (!normalizedPath) {
+      return '';
+    }
+    if (isAbsolute(normalizedPath)) {
+      this.observeWechatMediaPath(normalizedPath);
+      return normalizedPath;
+    }
+
+    const candidateRoots = [...this.wechatFilesRoots];
+    const candidates = candidateRoots.map((root) => normalizeWindowsPath(resolve(root, normalizedPath)));
+    for (const candidate of candidates) {
+      try {
+        await access(candidate);
+        this.observeWechatMediaPath(candidate);
+        return candidate;
+      } catch {
+        // Keep trying other known roots; the file may not exist until downloadAttach finishes.
+      }
+    }
+
+    return candidates[0] || normalizedPath;
   }
 
   async decryptImageBySvrId(svrId, chatWxid, options = {}) {
@@ -229,21 +381,43 @@ export class WechatFerryBridge extends EventEmitter {
     };
     const outputDir = await ensureMediaStorageDir(downloadConfig, 'images');
 
-    // Trigger download if needed
-    const localId = String(historyMsg.local_id || '');
-    const thumbPath = historyMsg.thumb_path || '';
-    const extraPath = historyMsg.extra_path;
-    this.agent.wcf.downloadAttach(localId, thumbPath, extraPath);
+    const messageId = String(svrId || '');
+    const thumbPath = await this.resolveHistoryMediaPath(historyMsg.thumb_path || '');
+    const extraPath = await this.resolveHistoryMediaPath(historyMsg.extra_path);
+    let hadSourceFile = false;
+    try {
+      await access(extraPath);
+      hadSourceFile = true;
+    } catch {
+      hadSourceFile = false;
+    }
+
+    const downloadStatus = this.agent.wcf.downloadAttach(messageId, thumbPath, extraPath);
+    if (downloadStatus !== 0 && !hadSourceFile) {
+      throw new Error(`Image download failed with status ${downloadStatus}`);
+    }
 
     for (let attempt = 0; attempt < timeoutSeconds; attempt += 1) {
       const sourcePath = this.agent.wcf.decryptImage(extraPath, outputDir);
       if (sourcePath) {
+        const saved = await saveGeneratedLocalFile(sourcePath, {
+          id: messageId,
+          type: historyMsg.type,
+          thumb: thumbPath,
+          extra: extraPath,
+        }, downloadConfig, {
+          subdir: 'images',
+        });
+
         return {
-          message_id: svrId,
+          message_id: messageId,
           local_id: historyMsg.local_id,
-          media: { kind: 'image' },
-          saved_path: sourcePath,
-          file_name: sourcePath.split(/[/\\]/).pop() || 'image.png',
+          media: {
+            kind: 'image',
+            thumb_path: thumbPath,
+            extra_path: extraPath,
+          },
+          ...saved,
         };
       }
       await sleep(1000);
@@ -253,23 +427,104 @@ export class WechatFerryBridge extends EventEmitter {
   }
 
   lookupLocalIdBySvrId(svrId) {
-    // Search across all MSG databases for a message with this MsgSvrID
-    const dbList = this.agent.getDbList?.() ?? [];
-    const msgDbs = dbList.filter(name => /^MSG\d*\.db$/i.test(name));
-    for (const dbName of msgDbs) {
-      try {
-        const rows = this.agent.dbSqlQuery?.(dbName, `SELECT localId FROM MSG WHERE MsgSvrID=${svrId} LIMIT 1`);
-        if (Array.isArray(rows) && rows.length > 0 && rows[0]?.localId) {
-          return Number(rows[0].localId);
-        }
-      } catch {
-        // skip
-      }
+    const normalizedSvrId = String(svrId ?? '').trim();
+    if (!normalizedSvrId) {
+      return null;
     }
-    return null;
+
+    const rows = this.queryMessageRows(`
+      SELECT localId AS localId, CreateTime AS createTime
+      FROM MSG
+      WHERE CAST(MsgSvrID AS TEXT) = ${escapeSqlStringLiteral(normalizedSvrId)}
+      ORDER BY CreateTime DESC
+      LIMIT 1
+    `);
+    const [match] = rows.sort(compareCreateTimeDesc);
+    return match?.localId ? Number(match.localId) : null;
+  }
+
+  lookupSvrIdByLocalId(localId) {
+    const record = this.lookupMessageIdentifiersByLocalId(localId);
+    return String(record?.msgSvrIdStr || '').trim();
+  }
+
+  lookupMessageIdentifiersByLocalId(localId) {
+    const normalizedLocalId = clampPositiveInteger(localId, 0, { min: 0 });
+    if (!normalizedLocalId) {
+      return null;
+    }
+
+    const rows = this.queryMessageRows(`
+      SELECT
+        localId AS localId,
+        MsgSvrID AS msgSvrId,
+        CAST(MsgSvrID AS TEXT) AS msgSvrIdStr,
+        Sequence AS sequence,
+        MsgServerSeq AS msgServerSeq,
+        MsgSequence AS msgSequence,
+        CreateTime AS createTime
+      FROM MSG
+      WHERE localId = ${normalizedLocalId}
+      ORDER BY CreateTime DESC
+      LIMIT 1
+    `);
+    const [match] = rows.sort(compareCreateTimeDesc);
+    return match || null;
+  }
+
+  queryMessageRows(sql, dbNumber) {
+    const rows = this.agent.dbSqlQueryMSG?.(sql, dbNumber);
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  revokeMessageCandidates(candidateIds = []) {
+    const attemptedIds = [];
+    let lastStatus = -1;
+
+    for (const candidateId of candidateIds.map(normalizeCandidateIdentifier)) {
+      if (!candidateId || attemptedIds.includes(candidateId)) {
+        continue;
+      }
+
+      attemptedIds.push(candidateId);
+      const status = this.agent.revokeMsg(candidateId);
+      if (status === 1) {
+        return {
+          ok: true,
+          status,
+          attempted_ids: attemptedIds,
+          revoked_id: candidateId,
+        };
+      }
+
+      lastStatus = status;
+    }
+
+    return {
+      ok: false,
+      status: attemptedIds.length === 0 ? -2 : lastStatus,
+      attempted_ids: attemptedIds,
+    };
+  }
+
+  formatHistoryRow(message) {
+    if (!message) {
+      return null;
+    }
+
+    if (typeof this.agent.formatHistoryMessage === 'function') {
+      return this.agent.formatHistoryMessage(message);
+    }
+
+    return message;
   }
 
   getHistory(chatWxid, options = {}) {
+    const normalizedChatWxid = String(chatWxid ?? '').trim();
+    if (!normalizedChatWxid) {
+      return [];
+    }
+
     const limit = Number.isFinite(Number(options.limit))
       ? Math.min(Math.max(Number(options.limit), 1), 200)
       : 50;
@@ -280,19 +535,16 @@ export class WechatFerryBridge extends EventEmitter {
       ? Number(options.dbNumber)
       : undefined;
 
-    const history = this.agent.getHistoryMessageList(
-      chatWxid,
-      (sql) => {
-        if (beforeCreateTime) {
-          sql.andWhere('MSG.CreateTime', '<', beforeCreateTime);
-        }
-        sql.limit(limit);
-      },
-      dbNumber,
-    );
+    const history = this.queryMessageRows(buildHistorySelectSql({
+      whereClause: `TalkerId.UsrName = ${escapeSqlStringLiteral(normalizedChatWxid)}`,
+      limit,
+      beforeCreateTime,
+    }), dbNumber)
+      .map((message) => this.formatHistoryRow(message))
+      .filter(Boolean);
 
     return history
-      .sort((left, right) => Number(right?.createTime || 0) - Number(left?.createTime || 0))
+      .sort(compareCreateTimeDesc)
       .slice(0, limit)
       .map(normalizeHistoryMessage);
   }
@@ -315,7 +567,35 @@ export class WechatFerryBridge extends EventEmitter {
       return null;
     }
 
-    const message = this.agent.getLastSelfMessage(normalizedLocalId);
+    const [message] = this.queryMessageRows(`
+      SELECT
+        localId AS localId,
+        TalkerId AS talkerId,
+        MsgSvrID AS msgSvrId,
+        CAST(MsgSvrID AS TEXT) AS msgSvrIdStr,
+        Type AS type,
+        SubType AS subType,
+        IsSender AS isSender,
+        CreateTime AS createTime,
+        Sequence AS sequence,
+        StatusEx AS statusEx,
+        FlagEx AS flagEx,
+        Status AS status,
+        MsgServerSeq AS msgServerSeq,
+        MsgSequence AS msgSequence,
+        StrTalker AS strTalker,
+        StrContent AS strContent,
+        BytesExtra AS bytesExtra,
+        CompressContent AS compressContent
+      FROM MSG
+      WHERE IsSender = 1 AND localId = ${normalizedLocalId}
+      ORDER BY CreateTime DESC
+      LIMIT 1
+    `)
+      .sort(compareCreateTimeDesc)
+      .map((entry) => this.formatHistoryRow(entry))
+      .filter(Boolean);
+
     if (!message?.localId) {
       return null;
     }
@@ -336,7 +616,7 @@ export class WechatFerryBridge extends EventEmitter {
 
     while (Date.now() <= deadline) {
       const message = this.getSelfMessageByLocalId(normalizedLocalId);
-      if (message && (!requireMessageId || message.msgid)) {
+      if (message && (!requireMessageId || hasReadyMessageId(message.msgid))) {
         return message;
       }
 
@@ -369,7 +649,7 @@ export class WechatFerryBridge extends EventEmitter {
       });
 
       if (match) {
-        if (!requireMessageId || match.msgid) {
+        if (!requireMessageId || hasReadyMessageId(match.msgid)) {
           return match;
         }
 

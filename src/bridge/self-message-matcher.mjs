@@ -5,6 +5,11 @@ function normalizeInteger(value, defaultValue = 0) {
   return Number.isFinite(normalized) ? normalized : defaultValue;
 }
 
+export function hasReadyMessageId(value) {
+  const normalized = resolveNonEmptyString(value);
+  return Boolean(normalized && normalized !== '0');
+}
+
 export function findMatchingSelfHistoryMessage(history, criteria = {}) {
   if (!Array.isArray(history) || history.length === 0) {
     return null;
@@ -47,7 +52,7 @@ export function findMatchingSelfHistoryMessage(history, criteria = {}) {
       continue;
     }
 
-    if (requireMessageId && !resolveNonEmptyString(entry.msgid)) {
+    if (requireMessageId && !hasReadyMessageId(entry.msgid)) {
       continue;
     }
 

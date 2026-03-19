@@ -6,6 +6,7 @@ import { streamLocalFileResponse } from './file-response.mjs';
 import { getPathname, getRequestUrl, isJsonRequest, readJsonBody, writeJson } from './http-utils.mjs';
 import { createLogger } from '../logger.mjs';
 import { normalizeOcrResult } from '../media/ocr-result.mjs';
+import { hasReadyMessageId } from '../bridge/self-message-matcher.mjs';
 import {
   normalizeAtList,
   normalizeConversationId,
@@ -212,22 +213,28 @@ function formatErrorMessage(error) {
 }
 
 function buildSendSuccessBody(message, sentMessage, extra = {}) {
+  const normalizedSentMessage = sentMessage
+    ? {
+        ...sentMessage,
+        msgid: hasReadyMessageId(sentMessage.msgid) ? sentMessage.msgid : '',
+      }
+    : null;
   const body = {
     status: 'success',
     message,
     ...extra,
   };
 
-  if (sentMessage?.local_id) {
-    body.local_id = sentMessage.local_id;
+  if (normalizedSentMessage?.local_id) {
+    body.local_id = normalizedSentMessage.local_id;
   }
 
-  if (sentMessage) {
-    body.sent_message = sentMessage;
+  if (normalizedSentMessage) {
+    body.sent_message = normalizedSentMessage;
   }
 
-  if (sentMessage?.msgid) {
-    body.message_id = sentMessage.msgid;
+  if (hasReadyMessageId(normalizedSentMessage?.msgid)) {
+    body.message_id = normalizedSentMessage.msgid;
   }
 
   return body;
@@ -988,18 +995,33 @@ export function createBridgeRequestHandler({ bridge, config, runtimeState, saveR
             local_id: '',
           });
       if (!result.ok) {
+        if (result.status === -2) {
+          logger.warn('revoke_message pending message_id', {
+            message_id: messageId ?? '',
+            local_id: resolvedLocalId ?? localId ?? '',
+          });
+          writeJson(res, 409, { detail: 'message_id is not ready for this local_id yet' });
+          return;
+        }
+
         logger.error('revoke_message failed', {
           message_id: messageId ?? '',
-          local_id: localId ?? '',
+          local_id: resolvedLocalId ?? localId ?? '',
           status: result.status,
+          attempted_ids: Array.isArray(result.attempted_ids) ? result.attempted_ids.join(',') : '',
         });
-        writeJson(res, 500, { detail: `revoke_message failed with status ${result.status}` });
+        const attemptedIds = Array.isArray(result.attempted_ids) ? result.attempted_ids.filter(Boolean) : [];
+        const attemptedSuffix = attemptedIds.length > 0
+          ? ` (attempted ids: ${attemptedIds.join(', ')})`
+          : '';
+        writeJson(res, 500, { detail: `revoke_message failed with status ${result.status}${attemptedSuffix}` });
         return;
       }
 
       logger.info('revoke_message', {
         message_id: messageId ?? '',
-        local_id: localId ?? '',
+        local_id: resolvedLocalId ?? localId ?? '',
+        revoked_id: result.revoked_id ?? '',
       });
       writeJson(res, 200, { status: 'success', message: 'Message revoked' });
     }],
