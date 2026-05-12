@@ -7,3 +7,6 @@ logs/
 config.json
 openclaw-wentchat/
 *.log
+tmp/
+docs/wechatferry-revoke-*.md
+scripts/revoke-*.mjs

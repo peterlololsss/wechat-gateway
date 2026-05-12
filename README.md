@@ -1,16 +1,37 @@
-# WechatFerry Node Bridge
+# Wechat Gateway
 
-Runs on Windows, connects to the local desktop WeChat client through `wechatferry`, and exposes the HTTP contract described in [API.md](./API.md).
+Wechat Gateway is a Windows-only HTTP gateway for desktop WeChat. It connects to the logged-in WeChat PC client through WechatFerry and exposes a local HTTP API for bots, plugins, or services that need to send messages, receive inbound message webhooks, download media, inspect contacts/rooms, and manage selected room actions.
+
+The companion OpenClaw plugin can point its `bridgeApiUrl` at this service, but the gateway itself is framework-neutral: any client that speaks the API in [API.md](./API.md) can use it.
+
+## Requirements
+
+- Windows with WeChat Desktop installed and logged in
+- Node.js and pnpm
+- `wechatferry@0.0.26` from this repo's lockfile
+- A reachable webhook receiver if you want inbound messages pushed to another service
+
+## WechatFerry
+
+This project uses the Node.js WechatFerry packages to talk to the local WeChat client.
+
+Upstream references:
+
+- Official Node.js WechatFerry repo: https://github.com/wechatferry/wechatferry
+- WechatFerry docs: https://wcferry.netlify.app/
+- Original WeChatFerry project: https://github.com/lich0821/WeChatFerry
+
+The pinned setup targets WechatFerry `v39.4.5` and WeChat Desktop `3.9.12.17`.
 
 ## Run
 
-Install dependencies first:
+Install dependencies:
 
 ```bash
 pnpm install
 ```
 
-Then start the bridge:
+Start the gateway:
 
 ```bash
 node src/server.mjs
@@ -19,16 +40,14 @@ node src/server.mjs
 Run tests:
 
 ```bash
-node --test --experimental-test-isolation=none
+npm test
 ```
 
-`POST /resolve_mp_article` uses `playwright-core` and launches the local Edge browser channel by default. On a standard Windows install, no separate Playwright browser download is required.
-
-Outbound and room-management endpoints accept native WeChat IDs (`wxid_...`, `...@chatroom`) and compatibility-prefixed IDs like `ntchat:wxid_...`; the bridge normalizes them before calling WechatFerry.
+By default the gateway listens on `0.0.0.0:8000`.
 
 ## Config
 
-Edit `config.json`. Only include fields you want to override — all others fall back to defaults defined in `src/config/schema.mjs`.
+Create or edit `config.json`. Only include fields you want to override; all others fall back to defaults in `src/config/schema.mjs`.
 
 ```json
 {
@@ -42,26 +61,38 @@ Edit `config.json`. Only include fields you want to override — all others fall
 }
 ```
 
-**startup defaults** (see `src/config/schema.mjs` for the full list):
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `host` | `"0.0.0.0"` | HTTP listen address |
-| `port` | `8000` | HTTP listen port |
-| `webhookSecret` | `""` | Sent as `x-ntchat-secret` header on webhook pushes |
-| `channelName` | `"wechatferry"` | Channel identifier included in webhook payloads |
-| `logLevel` | `"info"` | `debug` / `info` / `warn` / `error` |
-| `debugRawInbound` | `false` | Log raw inbound message fields (temporary debugging) |
-| `autoLaunchWeChat` | `true` | Auto-start desktop WeChat on startup |
-| `wechatExecutablePath` | `""` | Override WeChat.exe path (auto-detected if empty) |
-| `mediaDownloadDir` | `"downloads"` | Where `POST /download_media` saves files |
-| `enableRoomMemberManagement` | `false` | Enable room invite/add/remove endpoints |
-| `adminApiToken` | `""` | Required when room management is enabled |
-
-**runtime** fields:
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `webhookUrl` | `""` | Inbound messages are pushed here. Empty = disabled |
-
 `POST /set_webhook` updates `runtime.webhookUrl` and writes it back to `config.json`.
+
+## Common Endpoints
+
+See [API.md](./API.md) for the full contract. Common endpoints include:
+
+- `GET /` health/status
+- `POST /send_text`
+- `POST /send_media_upload`
+- `POST /revoke_message`
+- `GET /contacts`
+- `GET /rooms`
+- `GET /room_members`
+- `GET /history`
+- `POST /download_media`
+- `POST /resolve_mp_article`
+
+Outbound and room-management endpoints accept native WeChat IDs such as `wxid_...` and `...@chatroom`. Compatibility-prefixed IDs such as `ntchat:wxid_...` are normalized before calling WechatFerry.
+
+## Revoke Compatibility DLL
+
+This repo includes a pinned native compatibility patch for message revoke support:
+
+```text
+skills/wechatferry-native-recovery/assets/ferry-revoke-fix.dll
+```
+
+Use it only with the matching WechatFerry / WeChat Desktop pairing. See [docs/native-compatibility-patch.md](./docs/native-compatibility-patch.md) and the native recovery skill at [skills/wechatferry-native-recovery/SKILL.md](./skills/wechatferry-native-recovery/SKILL.md).
+
+## Security Notes
+
+- Keep `config.json` private. It is ignored by git and may contain webhook URLs or tokens.
+- Set `webhookSecret` when pushing inbound messages to another service.
+- `adminApiToken` is required before enabling room-management endpoints.
+- Avoid committing real IPs, Tailscale hostnames, wxids, tokens, or local machine paths.

@@ -6,6 +6,7 @@ import { GroupContextStore } from './runtime/group-context-store.mjs';
 import { configureLogger, createLogger } from './logger.mjs';
 import { OutboundSendQueue } from './runtime/outbound-send-queue.mjs';
 import { createBridgeRequestHandler } from './http/request-handler.mjs';
+import { closeServer, listenServer, trackServerConnections } from './http/server-lifecycle.mjs';
 import { ensureWeChatRunning } from './bridge/wechat-launcher.mjs';
 import { postWebhook } from './http/webhook.mjs';
 import { WechatFerryBridge } from './bridge/wechatferry-adapter.mjs';
@@ -31,6 +32,8 @@ const server = http.createServer(createBridgeRequestHandler({
   inboundMessages,
   outboundSendQueue,
 }));
+trackServerConnections(server);
+let shuttingDown = false;
 
 function summarizeContentPreview(value) {
   const content = String(value || '').replace(/\s+/g, ' ').trim();
@@ -166,6 +169,17 @@ async function bootstrap() {
   logger.info('booting', {
     log_level: loggerConfig.level,
   });
+
+  await listenServer(server, config.host, config.port);
+  logger.info('listening', {
+    url: `http://${config.host}:${config.port}`,
+  });
+  if (runtimeState.webhookUrl) {
+    logger.info('webhook target configured', {
+      target_url: runtimeState.webhookUrl,
+    });
+  }
+
   const launchResult = await ensureWeChatRunning(config);
   if (launchResult.reason === 'launched') {
     logger.info('launched WeChat', {
@@ -190,32 +204,61 @@ async function bootstrap() {
   }
 
   bridge.start();
-
-  server.listen(config.port, config.host, () => {
-    logger.info('listening', {
-      url: `http://${config.host}:${config.port}`,
-    });
-    if (runtimeState.webhookUrl) {
-      logger.info('webhook target configured', {
-        target_url: runtimeState.webhookUrl,
-      });
-    }
-  });
 }
 
-bootstrap().catch((error) => {
+bootstrap().catch(async (error) => {
   const message = error instanceof Error ? error.message : String(error);
   logger.error('bootstrap failed', { error: message });
+  try {
+    await closeServer(server, { forceAfterMs: 500 });
+  } catch (closeError) {
+    logger.warn('server close after bootstrap failure failed', {
+      error: closeError instanceof Error ? closeError.message : String(closeError),
+    });
+  }
+  bridge.stop();
   process.exit(1);
 });
 
-function shutdown(signal) {
+async function shutdown(signal) {
+  if (shuttingDown) {
+    logger.warn('shutdown already in progress', { signal });
+    return;
+  }
+
+  shuttingDown = true;
   logger.info('shutting down', { signal });
-  server.close(() => {
-    bridge.stop();
-    process.exit(0);
-  });
+  const forceExitTimer = setTimeout(() => {
+    logger.error('forced exit after shutdown timeout', { signal });
+    process.exit(1);
+  }, 5000);
+  forceExitTimer.unref?.();
+
+  bridge.stop();
+  try {
+    await closeServer(server, { forceAfterMs: 500 });
+  } catch (error) {
+    logger.warn('server close during shutdown failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  clearTimeout(forceExitTimer);
+  process.exit(0);
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => {
+  if (shuttingDown) {
+    logger.warn('forcing process exit after repeated signal', { signal: 'SIGINT' });
+    process.exit(1);
+    return;
+  }
+  void shutdown('SIGINT');
+});
+process.on('SIGTERM', () => {
+  if (shuttingDown) {
+    logger.warn('forcing process exit after repeated signal', { signal: 'SIGTERM' });
+    process.exit(1);
+    return;
+  }
+  void shutdown('SIGTERM');
+});
